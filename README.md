@@ -21,3 +21,5 @@ subject line, so it is easy to find.
 [Golang 限流器 time/rate 实现剖析](https://www.cyhone.com/articles/analisys-of-golang-rate/)
 
 [Golang 限流器 time/rate 使用介绍](https://www.cyhone.com/articles/usage-of-golang-rate/)
+
+[x/time/rate注释版](https://github.com/chenyahui/AnnotatedCode/tree/master/go/x/time)
