@@ -15,3 +15,9 @@ this repository, see https://golang.org/doc/contribute.html.
 The main issue tracker for the time repository is located at
 https://github.com/golang/go/issues. Prefix your issue with "x/time:" in the
 subject line, so it is easy to find.
+
+# reference
+
+[Golang 限流器 time/rate 实现剖析](https://www.cyhone.com/articles/analisys-of-golang-rate/)
+
+[Golang 限流器 time/rate 使用介绍](https://www.cyhone.com/articles/usage-of-golang-rate/)

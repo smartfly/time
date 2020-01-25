@@ -22,6 +22,7 @@ type Limit float64
 const Inf = Limit(math.MaxFloat64)
 
 // Every converts a minimum time interval between events to a Limit.
+// 可以将时间转化为速率，例如：每5秒一个，转化为速率就是0.2-秒
 func Every(interval time.Duration) Limit {
 	if interval <= 0 {
 		return Inf
@@ -54,10 +55,10 @@ func Every(interval time.Duration) Limit {
 // The methods AllowN, ReserveN, and WaitN consume n tokens.
 type Limiter struct {
 	limit Limit
-	burst int
+	burst int // 桶的总大小
 
 	mu     sync.Mutex
-	tokens float64
+	tokens float64 // 桶中目前剩余的token数目，可以为负数
 	// last is the last time the limiter's tokens field was updated
 	last time.Time
 	// lastEvent is the latest time of a rate-limited event (past or future)
@@ -76,6 +77,7 @@ func (lim *Limiter) Limit() Limit {
 // Burst values allow more events to happen at once.
 // A zero Burst allows no events, unless limit == Inf.
 func (lim *Limiter) Burst() int {
+	// TODO 为什么此处不需要读写锁呢?
 	return lim.burst
 }
 
@@ -105,8 +107,8 @@ func (lim *Limiter) AllowN(now time.Time, n int) bool {
 type Reservation struct {
 	ok        bool
 	lim       *Limiter
-	tokens    int
-	timeToAct time.Time
+	tokens    int       // 本次消费的Token数
+	timeToAct time.Time // Token桶可以满足本次消费数目的时刻， 也就是消费的时刻+等待的时长
 	// This is the Limit at reservation time, it can change later.
 	limit Limit
 }
@@ -166,6 +168,7 @@ func (r *Reservation) CancelAt(now time.Time) {
 	// The duration between lim.lastEvent and r.timeToAct tells us how many tokens were reserved
 	// after r was obtained. These tokens should not be restored.
 	restoreTokens := float64(r.tokens) - r.limit.tokensFromDuration(r.lim.lastEvent.Sub(r.timeToAct))
+	// 当小于0, 表示不需要恢复
 	if restoreTokens <= 0 {
 		return
 	}
@@ -177,8 +180,9 @@ func (r *Reservation) CancelAt(now time.Time) {
 		tokens = burst
 	}
 	// update state
-	r.lim.last = now
+	r.lim.last = now // 这一点也很关键
 	r.lim.tokens = tokens
+	// 如果都相等，说明跟没有消费一样。直接还原成上一次的状态
 	if r.timeToAct == r.lim.lastEvent {
 		prevEvent := r.timeToAct.Add(r.limit.durationFromTokens(float64(-r.tokens)))
 		if !prevEvent.Before(now) {
@@ -249,10 +253,12 @@ func (lim *Limiter) WaitN(ctx context.Context, n int) (err error) {
 		return fmt.Errorf("rate: Wait(n=%d) would exceed context deadline", n)
 	}
 	// Wait if necessary
+	// delay为从当前时间开始，到满足条件，需要多长时间
 	delay := r.DelayFrom(now)
 	if delay == 0 {
 		return nil
 	}
+	// 开一个timer,就等吧
 	t := time.NewTimer(delay)
 	defer t.Stop()
 	select {
@@ -306,9 +312,12 @@ func (lim *Limiter) SetBurstAt(now time.Time, newBurst int) {
 // reserveN is a helper method for AllowN, ReserveN, and WaitN.
 // maxFutureReserve specifies the maximum reservation wait duration allowed.
 // reserveN returns Reservation, not *Reservation, to avoid allocation in AllowN and WaitN.
+// @param n 要消费的token数量
+// @param maxFutureReserve 愿意等待的最长时间
 func (lim *Limiter) reserveN(now time.Time, n int, maxFutureReserve time.Duration) Reservation {
 	lim.mu.Lock()
 
+	// 如果没有限制
 	if lim.limit == Inf {
 		lim.mu.Unlock()
 		return Reservation{
@@ -322,10 +331,12 @@ func (lim *Limiter) reserveN(now time.Time, n int, maxFutureReserve time.Duratio
 	now, last, tokens := lim.advance(now)
 
 	// Calculate the remaining number of tokens resulting from the request.
+	// 看一下取完之后，桶还能剩下多少token
 	tokens -= float64(n)
 
 	// Calculate the wait duration
 	var waitDuration time.Duration
+	// 如果token<0, 说明目前的token不够，需要等待一段时间
 	if tokens < 0 {
 		waitDuration = lim.limit.durationFromTokens(-tokens)
 	}
@@ -339,6 +350,7 @@ func (lim *Limiter) reserveN(now time.Time, n int, maxFutureReserve time.Duratio
 		lim:   lim,
 		limit: lim.limit,
 	}
+	// timeToAct表示当桶中满足token数目等于n的时间
 	if ok {
 		r.tokens = n
 		r.timeToAct = now.Add(waitDuration)
@@ -346,9 +358,9 @@ func (lim *Limiter) reserveN(now time.Time, n int, maxFutureReserve time.Duratio
 
 	// Update state
 	if ok {
-		lim.last = now
-		lim.tokens = tokens
-		lim.lastEvent = r.timeToAct
+		lim.last = now              // 	更新last时间
+		lim.tokens = tokens         //	更新桶里面的token数目
+		lim.lastEvent = r.timeToAct // 	更新lastEvent时间
 	} else {
 		lim.last = last
 	}
@@ -360,20 +372,28 @@ func (lim *Limiter) reserveN(now time.Time, n int, maxFutureReserve time.Duratio
 // advance calculates and returns an updated state for lim resulting from the passage of time.
 // lim is not changed.
 func (lim *Limiter) advance(now time.Time) (newNow time.Time, newLast time.Time, newTokens float64) {
+	// last代表上一个取的时候的时间
 	last := lim.last
 	if now.Before(last) {
 		last = now
 	}
 
 	// Avoid making delta overflow below when last is very old.
+	// maxElapsed表示，将Token桶填满需要多久
+	// 为什么要拆成两步做，是为了防止后面的delta溢出
+	// 因为默认情况下，last为0, 此时delta算出来的会非常大
 	maxElapsed := lim.limit.durationFromTokens(float64(lim.burst) - lim.tokens)
+	// elapsed表示从当前到上次一共过去了多久
+	// 当然了, elapsed不能大于将桶填满的时间
 	elapsed := now.Sub(last)
 	if elapsed > maxElapsed {
 		elapsed = maxElapsed
 	}
 
 	// Calculate the new number of tokens, due to time that passed.
+	// 计算下过去这段时间，一共产生了多少token
 	delta := lim.limit.tokensFromDuration(elapsed)
+	// token取burst最大值，因为显然token数不能大于桶容量
 	tokens := lim.tokens + delta
 	if burst := float64(lim.burst); tokens > burst {
 		tokens = burst
@@ -384,6 +404,7 @@ func (lim *Limiter) advance(now time.Time) (newNow time.Time, newLast time.Time,
 
 // durationFromTokens is a unit conversion function from the number of tokens to the duration
 // of time it takes to accumulate them at a rate of limit tokens per second.
+// 将token转化为需要等待时间： 即生成N个新的token一共需要多久
 func (limit Limit) durationFromTokens(tokens float64) time.Duration {
 	seconds := tokens / float64(limit)
 	return time.Nanosecond * time.Duration(1e9*seconds)
@@ -391,9 +412,11 @@ func (limit Limit) durationFromTokens(tokens float64) time.Duration {
 
 // tokensFromDuration is a unit conversion function from a time duration to the number of tokens
 // which could be accumulated during that duration at a rate of limit tokens per second.
+// 给定一段时长, 这段时间一共可以生成多少个Token
 func (limit Limit) tokensFromDuration(d time.Duration) float64 {
 	// Split the integer and fractional parts ourself to minimize rounding errors.
 	// See golang.org/issues/34861.
+	// 如果直接使用 d.Seconds() * float64(limit), 因为d.Seconds是float64的，两个小数相乘会带来精度的损失
 	sec := float64(d/time.Second) * float64(limit)
 	nsec := float64(d%time.Second) * float64(limit)
 	return sec + nsec/1e9
